@@ -33,7 +33,8 @@ local VALUE_SIZE      = 90        -- + 8 byte key + ~2 byte overhead ≈ 100 byt
 -- At scale 1 the working set is small enough that 8 Zipfian fibers
 -- hit the same hot keys constantly; batch=2 keeps conflicts near zero.
 local BATCH_SIZE      = tonumber(arg and arg[3]) or
-                        (SCALE_FACTOR <= 1 and 2 or 100)
+                        math.max(2, math.floor(SCALE_FACTOR *
+                            math.log10(SCALE_FACTOR) + 0.5))
 local LOAD_BATCH      = 5000      -- statements per transaction during load
 local NUM_FIBERS      = 8         -- concurrent workers
 local ZIPF_THETA      = 0.99     -- skew: ~1% of keys get ~50% of traffic
@@ -52,9 +53,8 @@ box.cfg{
     log_level = 'info',
     checkpoint_count    = 2,
     checkpoint_interval = 600,
-    vinyl_cache         = 0,
+    vinyl_cache         = tonumber(os.getenv('VINYL_CACHE')) or 0,
     vinyl_memory        = RAM_BUDGET * 2,
-    vinyl_index_cache   = RAM_BUDGET,
 }
 
 -- Schema (idempotent).
@@ -66,7 +66,7 @@ if box.space.bench_a == nil then
             { name = 'value', type = 'string'   },
         },
     })
-    s:create_index('pk', { parts = { 'id' } })
+    s:create_index('pk', { parts = { 'id' },  })
     log.info('bench_a: created space')
 end
 
@@ -238,6 +238,13 @@ local function reporter()
         end
         log.info('bench_a: scheduler dump=%d tasks_completed=%d',
                  vs.scheduler.dump_count, vs.scheduler.tasks_completed)
+        if vs.dict then
+            log.info('bench_a: dict attempted=%d throttled=%d failed=%d rejected=%d accepted=%d active=%d bytes=%d',
+                     vs.dict.train_attempted or 0, vs.dict.train_throttled or 0,
+                     vs.dict.train_failed or 0, vs.dict.train_rejected or 0,
+                     vs.dict.train_accepted or 0, vs.dict.dicts_active or 0,
+                     vs.dict.dicts_bytes or 0)
+        end
         local idx = space.index.pk
         if idx then
             local is = idx:stat()
@@ -303,14 +310,19 @@ log.info('Total written:   %d', total_written)
 if din > 0 then
     log.info('Write amplification: %.2f', total_written / din)
 end
-local space_amp = (is.disk.bytes or 1) / math.max(1, NUM_KEYS * 100)
-log.info('Space amplification: %.2f', space_amp)
+local live_data = math.max(1, space:count() * 100)
+local space_amp = (is.disk.bytes or 1) / live_data
+log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
+         space_amp, is.disk.bytes or 0, live_data)
 log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
 log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
-if vs.index_cache then
-    log.info('Index cache:     hit=%d miss=%d evict=%d mem=%d',
-             vs.index_cache.hit, vs.index_cache.miss,
-             vs.index_cache.evict, vs.index_cache.mem_used)
+local get_bytes  = is.get.bytes or 0
+local read_bytes = is.disk.iterator.read.bytes or 0
+log.info('Get bytes:       %d', get_bytes)
+log.info('Disk read bytes: %d', read_bytes)
+if get_bytes > 0 then
+    log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
+             read_bytes / get_bytes)
 end
 log.info('=== END REPORT ===')
 

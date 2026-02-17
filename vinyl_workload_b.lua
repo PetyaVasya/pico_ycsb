@@ -52,9 +52,8 @@ box.cfg{
     log_level = 'info',
     checkpoint_count    = 2,
     checkpoint_interval = 600,
-    vinyl_cache         = 0,
+    vinyl_cache         = tonumber(os.getenv('VINYL_CACHE')) or 0,
     vinyl_memory        = RAM_BUDGET * 2,
-    vinyl_index_cache   = RAM_BUDGET,
 }
 
 -- Schema (idempotent).
@@ -251,8 +250,17 @@ local function reporter()
                      vs.index_cache.hit, vs.index_cache.miss,
                      vs.index_cache.evict, vs.index_cache.mem_used)
         end
-        log.info('bench_b: scheduler dump=%d compaction=%d',
-                 vs.scheduler.dump_count, vs.scheduler.compaction_count)
+        log.info('bench_b: scheduler dump=%d compaction_input=%d compaction_output=%d',
+                 vs.scheduler.dump_count or 0,
+                 vs.scheduler.compaction_input or 0,
+                 vs.scheduler.compaction_output or 0)
+        if vs.dict then
+            log.info('bench_b: dict attempted=%d throttled=%d failed=%d rejected=%d accepted=%d active=%d bytes=%d',
+                     vs.dict.train_attempted or 0, vs.dict.train_throttled or 0,
+                     vs.dict.train_failed or 0, vs.dict.train_rejected or 0,
+                     vs.dict.train_accepted or 0, vs.dict.dicts_active or 0,
+                     vs.dict.dicts_bytes or 0)
+        end
         local idx = space.index.pk
         if idx then
             local is = idx:stat()
@@ -327,14 +335,19 @@ log.info('Total written:   %d', total_written)
 if din > 0 then
     log.info('Write amplification: %.2f', total_written / din)
 end
-local space_amp = (is.disk.bytes or 1) / math.max(1, INITIAL_KEYS * 100)
-log.info('Space amplification: %.2f', space_amp)
+local live_data = math.max(1, space:count() * 100)
+local space_amp = (is.disk.bytes or 1) / live_data
+log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
+         space_amp, is.disk.bytes or 0, live_data)
 log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
 log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
-if vs.index_cache then
-    log.info('Index cache:     hit=%d miss=%d evict=%d mem=%d',
-             vs.index_cache.hit, vs.index_cache.miss,
-             vs.index_cache.evict, vs.index_cache.mem_used)
+local get_bytes  = is.get.bytes or 0
+local read_bytes = is.disk.iterator.read.bytes or 0
+log.info('Get bytes:       %d', get_bytes)
+log.info('Disk read bytes: %d', read_bytes)
+if get_bytes > 0 then
+    log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
+             read_bytes / get_bytes)
 end
 log.info('=== END REPORT ===')
 

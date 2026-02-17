@@ -58,9 +58,8 @@ box.cfg{
     log_level = 'info',
     checkpoint_count    = 2,
     checkpoint_interval = 600,
-    vinyl_cache         = 0,  -- disable tuple cache to force disk reads
+    vinyl_cache         = tonumber(os.getenv('VINYL_CACHE')) or 0,
     vinyl_memory        = RAM_BUDGET * 2,  -- ~40 MB
-    vinyl_index_cache   = RAM_BUDGET,      -- ~20 MB
 }
 
 -- Schema (idempotent).
@@ -72,12 +71,8 @@ if box.space.bench_c == nil then
             { name = 'value', type = 'string'   },
         },
     })
-    -- High run_count_per_level to accumulate tombstones before
-    -- shape-based compaction kicks in — lets us observe the
-    -- read-amp driver in action.
     s:create_index('pk', {
         parts = { 'id' },
-        run_count_per_level = 10,
     })
     log.info('bench_c: created space')
 end
@@ -267,6 +262,13 @@ local function reporter()
                          is.disk.iterator.bloom.hit,
                          is.disk.iterator.bloom.miss)
             end
+            if vs.dict then
+                log.info('bench_c: dict attempted=%d throttled=%d failed=%d rejected=%d accepted=%d active=%d bytes=%d',
+                         vs.dict.train_attempted or 0, vs.dict.train_throttled or 0,
+                         vs.dict.train_failed or 0, vs.dict.train_rejected or 0,
+                         vs.dict.train_accepted or 0, vs.dict.dicts_active or 0,
+                         vs.dict.dicts_bytes or 0)
+            end
             if vs.index_cache then
                 log.info('bench_c: index_cache hit=%d miss=%d mem=%dMB',
                          vs.index_cache.hit, vs.index_cache.miss,
@@ -333,14 +335,19 @@ if din > 0 then
     log.info('Write amplification: %.2f (total_written / dump_input)',
              total_written / din)
 end
-local space_amp = (is.disk.bytes or 1) / math.max(1, NUM_KEYS * 100)
-log.info('Space amplification: %.2f (disk_bytes / logical_size)', space_amp)
+local live_data = math.max(1, space:count() * 100)
+local space_amp = (is.disk.bytes or 1) / live_data
+log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
+         space_amp, is.disk.bytes or 0, live_data)
 log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
 log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
-if vs.index_cache then
-    log.info('Index cache:     hit=%d miss=%d evict=%d mem=%d',
-             vs.index_cache.hit, vs.index_cache.miss,
-             vs.index_cache.evict, vs.index_cache.mem_used)
+local get_bytes  = is.get.bytes or 0
+local read_bytes = is.disk.iterator.read.bytes or 0
+log.info('Get bytes:       %d', get_bytes)
+log.info('Disk read bytes: %d', read_bytes)
+if get_bytes > 0 then
+    log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
+             read_bytes / get_bytes)
 end
 log.info('=== END REPORT ===')
 
