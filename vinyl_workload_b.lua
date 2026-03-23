@@ -118,9 +118,7 @@ local function load_data()
             end
         end
     end
-    if batch > 0 then
-        box.commit()
-    end
+    box.commit()
     local elapsed = clock.monotonic() - t0
     log.info('bench_b: load complete, %d rows in %.1fs', space:count(), elapsed)
     box.snapshot()
