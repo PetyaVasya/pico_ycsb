@@ -61,7 +61,9 @@ if box.space.bench_d == nil then
     s:create_index('pk', {
         parts = { 'ts' },
         tombstone_threshold = 0.8,
-        stmt_delete_histogram_max_bins = 100,
+        -- stmt_delete_histogram_max_bins = 100,
+        tombstone_compaction_ttl = 180,
+        compaction_priority_refresh_interval = 1,
     })
     log.info('bench_d: created space')
 end
