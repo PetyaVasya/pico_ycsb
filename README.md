@@ -13,6 +13,7 @@ Used to produce the benchmark results in
 | **A** | 50% read / 50% update, Zipfian | Hot-key contention, overlapping runs, bloom filter stress |
 | **B** | 50% sequential insert / 50% read | Time-series append, non-overlapping run detection |
 | **C** | 30% delete / 20% insert / 30% scan / 20% read | Tombstone accumulation, read-amp driven compaction |
+| **D** | 50% delete / 50% | Queue simulation, tombstone accumulation |
 
 ## Quick start
 
@@ -20,7 +21,7 @@ Used to produce the benchmark results in
 ./run_all.sh /path/to/tarantool my_test
 ```
 
-Results go to `/var/opt/bench/my_test_{a,b,c}/`.
+Results go to `/var/opt/bench/my_test_{a,b,c,d}/`.
 
 ## Usage
 
@@ -46,6 +47,7 @@ Set `VINYL_CACHE` to control the Vinyl page cache size (default: 0).
 tarantool vinyl_workload_a.lua [minutes] [scale] [batch_size]
 tarantool vinyl_workload_b.lua [minutes] [scale]
 tarantool vinyl_workload_c.lua [minutes] [scale]
+tarantool vinyl_workload_d.lua [minutes] [scale]
 ```
 
 ## Metrics
