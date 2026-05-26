@@ -3,10 +3,8 @@
 -- Vinyl Workload B: Time-Series Append
 -- (modeled after YCSB-D / RocksDB fillseq + readrandom)
 --
--- Write path: sequential inserts at the end of the key space
--- (monotonically increasing keys, like timestamps).
--- Read path: 80% reads favor recent data (latest 1%), 20% uniform.
--- Mix: 50% inserts, 50% reads.
+-- Steady phase: each iteration with probability 0.5 appends a batch at the
+-- high end, else performs BATCH_SIZE point lookups (80% latest 1%, 20% uniform).
 --
 -- Dataset: pre-loaded to ~20 GB (200M rows), then keeps growing.
 --
@@ -16,7 +14,7 @@
 -- With sketch-based compaction, disjoint runs are left alone.
 --
 -- Usage:
---   tarantool vinyl_workload_b.lua [minutes]
+--   tarantool workload/b.lua [minutes] [scale_factor]
 --
 -- Resumable: the next key to insert is derived from space:len().
 -- Default runtime is 10 minutes.
@@ -35,11 +33,10 @@ local RUNTIME_MINUTES = tonumber(arg and arg[1]) or
                         math.max(1, math.floor(SCALE_FACTOR /
                             math.max(1, 2 * math.log10(SCALE_FACTOR)) + 0.5))
 local INITIAL_KEYS    = 2000000 * SCALE_FACTOR
-local VALUE_SIZE      = 90        -- ~100 bytes per row with key
+local VALUE_SIZE      = 80        -- ~100 bytes per row with key
 local BATCH_SIZE      = 200       -- statements per transaction
 local LOAD_BATCH      = 5000      -- statements per transaction during load
-local NUM_WRITERS     = 4         -- writer fibers
-local NUM_READERS     = 4         -- reader fibers
+local NUM_FIBERS      = 8         -- concurrent workers
 
 local RAM_BUDGET      = 2 * 1024 * 1024 * SCALE_FACTOR
 
@@ -67,7 +64,8 @@ if box.space.bench_b == nil then
     })
     s:create_index('pk', {
         parts = { 'ts' },
-        run_count_per_level = 2,
+        tombstone_count_threshold = 0.3,
+        stmt_histogram_max_bins = 128,
     })
     log.info('bench_b: created space')
 end
@@ -118,7 +116,9 @@ local function load_data()
             end
         end
     end
+    -- if batch > 0 then
     box.commit()
+    -- end
     local elapsed = clock.monotonic() - t0
     log.info('bench_b: load complete, %d rows in %.1fs', space:count(), elapsed)
     box.snapshot()
@@ -142,25 +142,50 @@ local stats = {
 local stop = false
 
 -------------------------------------------------------------------------------
--- Writer fibers: sequential append
+-- Worker fibers: 50% sequential append, 50% latest-biased point lookups
 -------------------------------------------------------------------------------
 
-local function writer(id)
-    log.info('bench_b: writer %d started', id)
-    local local_inserts = 0
-    local local_errors  = 0
+local function worker(id)
+    log.info('bench_b: worker %d started', id)
+    local local_inserts   = 0
+    local local_reads     = 0
+    local local_read_miss = 0
+    local local_errors    = 0
 
     while not stop do
-        local base = next_key
-        next_key = next_key + BATCH_SIZE
-
         local ok, err = pcall(function()
-            box.begin()
-            for i = 0, BATCH_SIZE - 1 do
-                space:replace({ base + i, random_value() })
+            if math.random() < 0.5 then
+                local base = next_key
+                next_key = next_key + BATCH_SIZE
+                box.begin()
+                for i = 0, BATCH_SIZE - 1 do
+                    space:replace({ base + i, random_value() })
+                end
+                box.commit()
+                local_inserts = local_inserts + BATCH_SIZE
+            else
+                local max_key = next_key - 1
+                if max_key < 1 then
+                    return
+                end
+                for _ = 1, BATCH_SIZE do
+                    local key
+                    if math.random() < 0.8 then
+                        -- 80%: read from the latest 1% of data.
+                        local recent_start = math.max(1,
+                            math.floor(max_key * 0.99))
+                        key = math.random(recent_start, max_key)
+                    else
+                        -- 20%: uniform random across all data.
+                        key = math.random(1, max_key)
+                    end
+                    local tuple = space:get(key)
+                    local_reads = local_reads + 1
+                    if tuple == nil then
+                        local_read_miss = local_read_miss + 1
+                    end
+                end
             end
-            box.commit()
-            local_inserts = local_inserts + BATCH_SIZE
         end)
         if not ok then
             pcall(box.rollback)
@@ -169,58 +194,28 @@ local function writer(id)
         fiber.yield()
     end
 
-    stats.inserts = stats.inserts + local_inserts
-    stats.errors  = stats.errors  + local_errors
-    log.info('bench_b: writer %d done (inserts=%d errors=%d)',
-             id, local_inserts, local_errors)
-end
-
--------------------------------------------------------------------------------
--- Reader fibers: latest-biased point lookups
--------------------------------------------------------------------------------
-
-local function reader(id)
-    log.info('bench_b: reader %d started', id)
-    local local_reads     = 0
-    local local_read_miss = 0
-    local local_errors    = 0
-
-    while not stop do
-        local ok, err = pcall(function()
-            for _ = 1, BATCH_SIZE do
-                local max_key = next_key - 1
-                if max_key < 1 then
-                    fiber.yield()
-                    return
-                end
-                local key
-                if math.random() < 0.8 then
-                    -- 80%: read from the latest 1% of data.
-                    local recent_start = math.max(1,
-                        math.floor(max_key * 0.99))
-                    key = math.random(recent_start, max_key)
-                else
-                    -- 20%: uniform random across all data.
-                    key = math.random(1, max_key)
-                end
-                local tuple = space:get(key)
-                local_reads = local_reads + 1
-                if tuple == nil then
-                    local_read_miss = local_read_miss + 1
-                end
-            end
-        end)
-        if not ok then
-            local_errors = local_errors + 1
-        end
-        fiber.yield()
-    end
-
+    stats.inserts   = stats.inserts   + local_inserts
     stats.reads     = stats.reads     + local_reads
     stats.read_miss = stats.read_miss + local_read_miss
     stats.errors    = stats.errors    + local_errors
-    log.info('bench_b: reader %d done (reads=%d miss=%d errors=%d)',
-             id, local_reads, local_read_miss, local_errors)
+    log.info('bench_b: worker %d done (inserts=%d reads=%d miss=%d errors=%d)',
+             id, local_inserts, local_reads, local_read_miss, local_errors)
+end
+
+-------------------------------------------------------------------------------
+-- Final report helpers
+-------------------------------------------------------------------------------
+
+local function log_histogram_estimate(is)
+    local he = is.histogram_estimate
+    if he == nil or (he.sample_count or 0) == 0 then
+        log.info('Histogram estimate: no samples')
+        return
+    end
+    log.info('Histogram abs_error: %.4f', he.abs_error)
+    log.info('Histogram rel_error: %.4f', he.rel_error)
+    log.info('Histogram q_error:   %.4f', he.q_error)
+    log.info('Histogram samples:   %d', he.sample_count)
 end
 
 -------------------------------------------------------------------------------
@@ -276,25 +271,14 @@ end
 -- Main
 -------------------------------------------------------------------------------
 
-log.info('bench_b: starting %d writers + %d readers for %d minutes',
-         NUM_WRITERS, NUM_READERS, RUNTIME_MINUTES)
+log.info('bench_b: starting %d fibers for %d minutes', NUM_FIBERS, RUNTIME_MINUTES)
 math.randomseed(tonumber(clock.realtime64() % 2147483647))
 
 local fibers = {}
-local n = 0
-
-for i = 1, NUM_WRITERS do
-    n = n + 1
-    fibers[n] = fiber.new(writer, i)
-    fibers[n]:set_joinable(true)
-    fibers[n]:name('bench_b_w' .. i)
-end
-
-for i = 1, NUM_READERS do
-    n = n + 1
-    fibers[n] = fiber.new(reader, i)
-    fibers[n]:set_joinable(true)
-    fibers[n]:name('bench_b_r' .. i)
+for i = 1, NUM_FIBERS do
+    fibers[i] = fiber.new(worker, i)
+    fibers[i]:set_joinable(true)
+    fibers[i]:name('bench_b_' .. i)
 end
 
 local rep = fiber.new(reporter)
@@ -303,7 +287,7 @@ rep:name('bench_b_rep')
 fiber.sleep(RUNTIME_MINUTES * 60)
 stop = true
 
-for i = 1, n do
+for i = 1, NUM_FIBERS do
     fibers[i]:join()
 end
 
@@ -320,6 +304,7 @@ log.info('RPS:             %.0f', total_ops / elapsed_s)
 log.info('Errors:          %d', stats.errors)
 log.info('Ranges:          %d', is.range_count)
 log.info('Runs:            %d', is.run_count)
+log_histogram_estimate(is)
 log.info('Disk bytes:      %d', is.disk.bytes or 0)
 log.info('Dump count:      %d', vs.scheduler.dump_count or 0)
 local cin  = is.disk.compaction.input.bytes or 0
@@ -327,16 +312,13 @@ local cout = is.disk.compaction.output.bytes or 0
 local din  = is.disk.dump.input.bytes or 0
 local dout = is.disk.dump.output.bytes or 0
 log.info('Compaction I/O:  in=%d out=%d', cin, cout)
+log.info('Compaction count: %d', is.disk.compaction.count or 0)
 log.info('Dump I/O:        in=%d out=%d', din, dout)
 local total_written = cout + dout
 log.info('Total written:   %d', total_written)
 if din > 0 then
     log.info('Write amplification: %.2f', total_written / din)
 end
-local live_data = math.max(1, space:count() * 100)
-local space_amp = (is.disk.bytes or 1) / live_data
-log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
-         space_amp, is.disk.bytes or 0, live_data)
 log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
 log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
 local get_bytes  = is.get.bytes or 0
@@ -345,8 +327,64 @@ log.info('Get bytes:       %d', get_bytes)
 log.info('Disk read bytes: %d', read_bytes)
 if get_bytes > 0 then
     log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
-             read_bytes / get_bytes)
+            read_bytes / get_bytes)
 end
+log.info('Index memory:    %d', space.index.pk:bsize() or 0)
+log.info('Regulator write rate: %.2f', vs.regulator.write_rate)
+log.info('Regulator dump bandwidth: %.2f', vs.regulator.dump_bandwidth)
+log.info('Regulator dump watermark: %.2f', vs.regulator.dump_watermark)
+log.info('Regulator rate limit: %.2f', vs.regulator.rate_limit)
 log.info('=== END REPORT ===')
 
+fiber.sleep(30)
+
+log.info('bench_b: DONE inserts=%d reads=%d read_miss=%d errors=%d',
+         stats.inserts, stats.reads, stats.read_miss, stats.errors)
+
+vs = box.stat.vinyl()
+is = space.index.pk:stat()
+total_ops = stats.inserts + stats.reads
+elapsed_s = RUNTIME_MINUTES * 60
+log.info('=== FINAL REPORT ===')
+log.info('Total ops:       %d', total_ops)
+log.info('RPS:             %.0f', total_ops / elapsed_s)
+log.info('Errors:          %d', stats.errors)
+log.info('Ranges:          %d', is.range_count)
+log.info('Runs:            %d', is.run_count)
+log_histogram_estimate(is)
+log.info('Disk bytes:      %d', is.disk.bytes or 0)
+log.info('Dump count:      %d', vs.scheduler.dump_count or 0)
+cin  = is.disk.compaction.input.bytes or 0
+cout = is.disk.compaction.output.bytes or 0
+din  = is.disk.dump.input.bytes or 0
+dout = is.disk.dump.output.bytes or 0
+log.info('Compaction I/O:  in=%d out=%d', cin, cout)
+log.info('Compaction count: %d', is.disk.compaction.count or 0)
+log.info('Dump I/O:        in=%d out=%d', din, dout)
+total_written = cout + dout
+log.info('Total written:   %d', total_written)
+if din > 0 then
+    log.info('Write amplification: %.2f', total_written / din)
+end
+local live_data = math.max(1, space:count() * 90)
+local space_amp = (is.disk.bytes or 1) / live_data
+log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
+        space_amp, is.disk.bytes or 0, live_data)
+log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
+log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
+get_bytes  = is.get.bytes or 0
+read_bytes = is.disk.iterator.read.bytes or 0
+log.info('Get bytes:       %d', get_bytes)
+log.info('Disk read bytes: %d', read_bytes)
+if get_bytes > 0 then
+    log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
+            read_bytes / get_bytes)
+end
+log.info('Index memory:    %d', space.index.pk:bsize() or 0)
+log.info('Regulator write rate: %.2f', vs.regulator.write_rate)
+log.info('Regulator dump bandwidth: %.2f', vs.regulator.dump_bandwidth)
+log.info('Regulator dump watermark: %.2f', vs.regulator.dump_watermark)
+log.info('Regulator rate limit: %.2f', vs.regulator.rate_limit)
+log.info('=== END REPORT ===')
+         
 os.exit(0)

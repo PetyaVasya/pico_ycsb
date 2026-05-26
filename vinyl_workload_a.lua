@@ -29,7 +29,7 @@ local RUNTIME_MINUTES = tonumber(arg and arg[1]) or
                         math.max(1, math.floor(SCALE_FACTOR /
                             math.max(1, 2 * math.log10(SCALE_FACTOR)) + 0.5))
 local NUM_KEYS        = 2000000 * SCALE_FACTOR
-local VALUE_SIZE      = 90        -- + 8 byte key + ~2 byte overhead ≈ 100 bytes/row
+local VALUE_SIZE      = 80        -- + 8 byte key + ~2 byte overhead ≈ 100 bytes/row
 -- At scale 1 the working set is small enough that 8 Zipfian fibers
 -- hit the same hot keys constantly; batch=2 keeps conflicts near zero.
 local BATCH_SIZE      = tonumber(arg and arg[3]) or
@@ -66,7 +66,13 @@ if box.space.bench_a == nil then
             { name = 'value', type = 'string'   },
         },
     })
-    s:create_index('pk', { parts = { 'id' },  })
+    s:create_index('pk', {
+        parts = { 'id' },
+        -- tombstone_threshold = 0.8,
+        stmt_histogram_max_bins = 128,
+        -- tombstone_compaction_ttl = 180,
+        -- compaction_priority_refresh_interval = 1,
+    })
     log.info('bench_a: created space')
 end
 
@@ -154,7 +160,9 @@ local function load_data()
             end
         end
     end
+    -- if batch > 0 then
     box.commit()
+    -- end
     local elapsed = clock.monotonic() - t0
     log.info('bench_a: load complete, %d rows in %.1fs', space:count(), elapsed)
     box.snapshot()
@@ -182,13 +190,14 @@ local function worker(id)
     while not stop do
         local ok, err = pcall(function()
             box.begin()
-            for _ = 1, BATCH_SIZE do
-                local key = zipf_next()
-                if math.random() < 0.5 then
-                    space:get(key)
+            if math.random() < 0.5 then
+                for _ = 1, BATCH_SIZE do
+                    space:get(zipf_next())
                     local_reads = local_reads + 1
-                else
-                    space:replace({ key, random_value() })
+                end
+            else
+                for _ = 1, BATCH_SIZE do
+                    space:replace({ zipf_next(), random_value() })
                     local_writes = local_writes + 1
                 end
             end
@@ -209,6 +218,22 @@ local function worker(id)
     stats.errors = stats.errors + local_errors
     log.info('bench_a: worker %d done (reads=%d writes=%d errors=%d)',
              id, local_reads, local_writes, local_errors)
+end
+
+-------------------------------------------------------------------------------
+-- Final report helpers
+-------------------------------------------------------------------------------
+
+local function log_histogram_estimate(is)
+    local he = is.histogram_estimate
+    if he == nil or (he.sample_count or 0) == 0 then
+        log.info('Histogram estimate: no samples')
+        return
+    end
+    log.info('Histogram abs_error: %.4f', he.abs_error)
+    log.info('Histogram rel_error: %.4f', he.rel_error)
+    log.info('Histogram q_error:   %.4f', he.q_error)
+    log.info('Histogram samples:   %d', he.sample_count)
 end
 
 -------------------------------------------------------------------------------
@@ -295,6 +320,7 @@ log.info('RPS:             %.0f', total_ops / elapsed_s)
 log.info('Errors:          %d', stats.errors)
 log.info('Ranges:          %d', is.range_count)
 log.info('Runs:            %d', is.run_count)
+log_histogram_estimate(is)
 log.info('Disk bytes:      %d', is.disk.bytes or 0)
 log.info('Dump count:      %d', vs.scheduler.dump_count or 0)
 local cin  = is.disk.compaction.input.bytes or 0
@@ -302,16 +328,13 @@ local cout = is.disk.compaction.output.bytes or 0
 local din  = is.disk.dump.input.bytes or 0
 local dout = is.disk.dump.output.bytes or 0
 log.info('Compaction I/O:  in=%d out=%d', cin, cout)
+log.info('Compaction count: %d', is.disk.compaction.count or 0)
 log.info('Dump I/O:        in=%d out=%d', din, dout)
 local total_written = cout + dout
 log.info('Total written:   %d', total_written)
 if din > 0 then
     log.info('Write amplification: %.2f', total_written / din)
 end
-local live_data = math.max(1, space:count() * 100)
-local space_amp = (is.disk.bytes or 1) / live_data
-log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
-         space_amp, is.disk.bytes or 0, live_data)
 log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
 log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
 local get_bytes  = is.get.bytes or 0
@@ -322,6 +345,62 @@ if get_bytes > 0 then
     log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
              read_bytes / get_bytes)
 end
+log.info('Index memory:    %d', space.index.pk:bsize() or 0)
+log.info('Regulator write rate: %.2f', vs.regulator.write_rate)
+log.info('Regulator dump bandwidth: %.2f', vs.regulator.dump_bandwidth)
+log.info('Regulator dump watermark: %.2f', vs.regulator.dump_watermark)
+log.info('Regulator rate limit: %.2f', vs.regulator.rate_limit)
+log.info('=== END REPORT ===')
+
+fiber.sleep(30)
+
+log.info('bench_a: DONE total reads=%d writes=%d errors=%d',
+         stats.reads, stats.writes, stats.errors)
+
+vs = box.stat.vinyl()
+is = space.index.pk:stat()
+total_ops = stats.reads + stats.writes
+elapsed_s = RUNTIME_MINUTES * 60
+log.info('=== FINAL REPORT ===')
+log.info('Total ops:       %d', total_ops)
+log.info('RPS:             %.0f', total_ops / elapsed_s)
+log.info('Errors:          %d', stats.errors)
+log.info('Ranges:          %d', is.range_count)
+log.info('Runs:            %d', is.run_count)
+log_histogram_estimate(is)
+log.info('Disk bytes:      %d', is.disk.bytes or 0)
+log.info('Dump count:      %d', vs.scheduler.dump_count or 0)
+cin  = is.disk.compaction.input.bytes or 0
+cout = is.disk.compaction.output.bytes or 0
+din  = is.disk.dump.input.bytes or 0
+dout = is.disk.dump.output.bytes or 0
+log.info('Compaction I/O:  in=%d out=%d', cin, cout)
+log.info('Compaction count: %d', is.disk.compaction.count or 0)
+log.info('Dump I/O:        in=%d out=%d', din, dout)
+total_written = cout + dout
+log.info('Total written:   %d', total_written)
+if din > 0 then
+    log.info('Write amplification: %.2f', total_written / din)
+end
+local live_data = math.max(1, space:count() * 90)
+local space_amp = (is.disk.bytes or 1) / live_data
+log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
+         space_amp, is.disk.bytes or 0, live_data)
+log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
+log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
+get_bytes  = is.get.bytes or 0
+read_bytes = is.disk.iterator.read.bytes or 0
+log.info('Get bytes:       %d', get_bytes)
+log.info('Disk read bytes: %d', read_bytes)
+if get_bytes > 0 then
+    log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
+             read_bytes / get_bytes)
+end
+log.info('Index memory:    %d', space.index.pk:bsize() or 0)
+log.info('Regulator write rate: %.2f', vs.regulator.write_rate)
+log.info('Regulator dump bandwidth: %.2f', vs.regulator.dump_bandwidth)
+log.info('Regulator dump watermark: %.2f', vs.regulator.dump_watermark)
+log.info('Regulator rate limit: %.2f', vs.regulator.rate_limit)
 log.info('=== END REPORT ===')
 
 os.exit(0)

@@ -32,7 +32,7 @@
 -------------------------------------------------------------------------------
 local SCALE_FACTOR    = tonumber(arg and arg[2]) or 10
 local NUM_KEYS        = 2000000 * SCALE_FACTOR
-local VALUE_SIZE      = 90        -- ~100 bytes per row
+local VALUE_SIZE      = 80        -- ~100 bytes per row
 local BATCH_SIZE      = 50        -- operations per transaction
 local LOAD_BATCH      = 5000      -- statements per transaction during load
 local SCAN_LENGTH     = 200       -- tuples to scan per range query
@@ -73,6 +73,11 @@ if box.space.bench_c == nil then
     })
     s:create_index('pk', {
         parts = { 'id' },
+        tombstone_threshold = 0.1,
+        stmt_histogram_max_bins = 128,
+        tombstone_compaction_ttl = 150,
+        compaction_priority_refresh_interval = 30,
+        tombstone_extend_mode = 'adjacent_levels'
     })
     log.info('bench_c: created space')
 end
@@ -236,6 +241,22 @@ local function worker(id)
 end
 
 -------------------------------------------------------------------------------
+-- Final report helpers
+-------------------------------------------------------------------------------
+
+local function log_histogram_estimate(is)
+    local he = is.histogram_estimate
+    if he == nil or (he.sample_count or 0) == 0 then
+        log.info('Histogram estimate: no samples')
+        return
+    end
+    log.info('Histogram abs_error: %.4f', he.abs_error)
+    log.info('Histogram rel_error: %.4f', he.rel_error)
+    log.info('Histogram q_error:   %.4f', he.q_error)
+    log.info('Histogram samples:   %d', he.sample_count)
+end
+
+-------------------------------------------------------------------------------
 -- Reporter fiber
 -------------------------------------------------------------------------------
 
@@ -307,36 +328,31 @@ log.info('bench_c: DONE del=%d ins=%d reads=%d scans=%d scan_rows=%d errors=%d',
          stats.deletes, stats.inserts, stats.reads,
          stats.scans, stats.scan_rows, stats.errors)
 
--- Final summary with amplification metrics.
 local vs = box.stat.vinyl()
 local is = space.index.pk:stat()
-local total_rps = stats.deletes + stats.inserts + stats.reads + stats.scans
+local total_ops = stats.deletes + stats.inserts + stats.reads + stats.scans
 local elapsed_s = RUNTIME_MINUTES * 60
 log.info('=== FINAL REPORT ===')
-log.info('Total ops:       %d', total_rps)
-log.info('RPS:             %.0f', total_rps / elapsed_s)
+log.info('Total ops:       %d', total_ops)
+log.info('RPS:             %.0f', total_ops / elapsed_s)
 log.info('Errors:          %d', stats.errors)
 log.info('Ranges:          %d', is.range_count)
 log.info('Runs:            %d', is.run_count)
+log_histogram_estimate(is)
 log.info('Disk bytes:      %d', is.disk.bytes or 0)
-log.info('Dump count:      %d', vs.scheduler.dump_count)
-log.info('Compaction tasks: %d', vs.scheduler.tasks_completed or 0)
+log.info('Dump count:      %d', vs.scheduler.dump_count or 0)
 local cin  = is.disk.compaction.input.bytes or 0
 local cout = is.disk.compaction.output.bytes or 0
 local din  = is.disk.dump.input.bytes or 0
 local dout = is.disk.dump.output.bytes or 0
 log.info('Compaction I/O:  in=%d out=%d', cin, cout)
+log.info('Compaction count: %d', is.disk.compaction.count or 0)
 log.info('Dump I/O:        in=%d out=%d', din, dout)
 local total_written = cout + dout
-log.info('Total written:   %d (compaction_out + dump_out)', total_written)
+log.info('Total written:   %d', total_written)
 if din > 0 then
-    log.info('Write amplification: %.2f (total_written / dump_input)',
-             total_written / din)
+    log.info('Write amplification: %.2f', total_written / din)
 end
-local live_data = math.max(1, space:count() * 100)
-local space_amp = (is.disk.bytes or 1) / live_data
-log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
-         space_amp, is.disk.bytes or 0, live_data)
 log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
 log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
 local get_bytes  = is.get.bytes or 0
@@ -345,8 +361,65 @@ log.info('Get bytes:       %d', get_bytes)
 log.info('Disk read bytes: %d', read_bytes)
 if get_bytes > 0 then
     log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
-             read_bytes / get_bytes)
+            read_bytes / get_bytes)
 end
+log.info('Index memory:    %d', space.index.pk:bsize() or 0)
+log.info('Regulator write rate: %.2f', vs.regulator.write_rate)
+log.info('Regulator dump bandwidth: %.2f', vs.regulator.dump_bandwidth)
+log.info('Regulator dump watermark: %.2f', vs.regulator.dump_watermark)
+log.info('Regulator rate limit: %.2f', vs.regulator.rate_limit)
 log.info('=== END REPORT ===')
 
+fiber.sleep(30)
+
+log.info('bench_c: DONE del=%d ins=%d reads=%d scans=%d scan_rows=%d errors=%d',
+         stats.deletes, stats.inserts, stats.reads,
+         stats.scans, stats.scan_rows, stats.errors)
+
+vs = box.stat.vinyl()
+is = space.index.pk:stat()
+total_ops = stats.deletes + stats.inserts + stats.reads + stats.scans
+elapsed_s = RUNTIME_MINUTES * 60
+log.info('=== FINAL REPORT ===')
+log.info('Total ops:       %d', total_ops)
+log.info('RPS:             %.0f', total_ops / elapsed_s)
+log.info('Errors:          %d', stats.errors)
+log.info('Ranges:          %d', is.range_count)
+log.info('Runs:            %d', is.run_count)
+log_histogram_estimate(is)
+log.info('Disk bytes:      %d', is.disk.bytes or 0)
+log.info('Dump count:      %d', vs.scheduler.dump_count or 0)
+cin  = is.disk.compaction.input.bytes or 0
+cout = is.disk.compaction.output.bytes or 0
+din  = is.disk.dump.input.bytes or 0
+dout = is.disk.dump.output.bytes or 0
+log.info('Compaction I/O:  in=%d out=%d', cin, cout)
+log.info('Compaction count: %d', is.disk.compaction.count or 0)
+log.info('Dump I/O:        in=%d out=%d', din, dout)
+total_written = cout + dout
+log.info('Total written:   %d', total_written)
+if din > 0 then
+    log.info('Write amplification: %.2f', total_written / din)
+end
+local live_data = math.max(1, space:count() * 90)
+local space_amp = (is.disk.bytes or 1) / live_data
+log.info('Space amplification: %.2f (disk_bytes=%d / live_data=%d)',
+        space_amp, is.disk.bytes or 0, live_data)
+log.info('Bloom hit:       %d', is.disk.iterator.bloom.hit)
+log.info('Bloom miss:      %d', is.disk.iterator.bloom.miss)
+get_bytes  = is.get.bytes or 0
+read_bytes = is.disk.iterator.read.bytes or 0
+log.info('Get bytes:       %d', get_bytes)
+log.info('Disk read bytes: %d', read_bytes)
+if get_bytes > 0 then
+    log.info('Read amplification: %.2f (disk_read_bytes / get_bytes)',
+            read_bytes / get_bytes)
+end
+log.info('Index memory:    %d', space.index.pk:bsize() or 0)
+log.info('Regulator write rate: %.2f', vs.regulator.write_rate)
+log.info('Regulator dump bandwidth: %.2f', vs.regulator.dump_bandwidth)
+log.info('Regulator dump watermark: %.2f', vs.regulator.dump_watermark)
+log.info('Regulator rate limit: %.2f', vs.regulator.rate_limit)
+log.info('=== END REPORT ===')
+         
 os.exit(0)
