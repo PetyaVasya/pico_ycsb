@@ -68,10 +68,8 @@ if box.space.bench_a == nil then
     })
     s:create_index('pk', {
         parts = { 'id' },
-        -- tombstone_threshold = 0.8,
+        tombstone_range_threshold = 0.3,
         stmt_histogram_max_bins = 128,
-        -- tombstone_compaction_ttl = 180,
-        -- compaction_priority_refresh_interval = 1,
     })
     log.info('bench_a: created space')
 end
@@ -224,16 +222,31 @@ end
 -- Final report helpers
 -------------------------------------------------------------------------------
 
-local function log_histogram_estimate(is)
-    local he = is.histogram_estimate
-    if he == nil or (he.sample_count or 0) == 0 then
-        log.info('Histogram estimate: no samples')
+local function log_slice_estimate(name, est, trigger_field)
+    if est == nil or (est.sample_count or 0) == 0 then
+        log.info('%s estimate: no samples', name)
         return
     end
-    log.info('Histogram abs_error: %.4f', he.abs_error)
-    log.info('Histogram rel_error: %.4f', he.rel_error)
-    log.info('Histogram q_error:   %.4f', he.q_error)
-    log.info('Histogram samples:   %d', he.sample_count)
+    log.info('%s abs_error: %.1f tuples', name, est.abs_error)
+    if est.rel_error ~= nil then
+        log.info('%s rel_error: %.2f%%', name, est.rel_error)
+    end
+    log.info('%s q_error:   %.4f', name, est.q_error)
+    log.info('%s samples:   %d', name, est.sample_count)
+    if trigger_field ~= nil then
+        log.info('%s %s: %d', name, trigger_field, est[trigger_field] or 0)
+        log.info('%s compaction_prefix_trigger: %d', name,
+                 est.compaction_prefix_trigger or 0)
+        log.info('%s compaction_fpr: %d', name, est.compaction_fpr or 0)
+        log.info('%s compaction_fnr: %d', name, est.compaction_fnr or 0)
+    end
+end
+
+local function log_histogram_estimate(is)
+    log_slice_estimate('Histogram', is.histogram_estimate,
+                       'compaction_hist_trigger')
+    log_slice_estimate('Ratio', is.ratio_estimate,
+                       'compaction_ratio_trigger')
 end
 
 -------------------------------------------------------------------------------
